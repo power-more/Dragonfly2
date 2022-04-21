@@ -19,13 +19,10 @@ package job
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"regexp"
-	"strings"
 	"time"
 
 	machineryv1tasks "github.com/RichardKnop/machinery/v1/tasks"
@@ -33,6 +30,7 @@ import (
 	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/containerd/remotes"
 	"github.com/containerd/containerd/remotes/docker"
+	"github.com/moby/buildkit/util/contentutil"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
@@ -76,13 +74,6 @@ type preheat struct {
 	bizTag string
 }
 
-type preheatImage struct {
-	protocol string
-	domain   string
-	name     string
-	tag      string
-}
-
 func newPreheat(job *internaljob.Job, bizTag string) (Preheat, error) {
 	return &preheat{
 		job:    job,
@@ -90,39 +81,42 @@ func newPreheat(job *internaljob.Job, bizTag string) (Preheat, error) {
 	}, nil
 }
 
-func (p *preheat) CreatePreheat(ctx context.Context, schedulers []model.Scheduler, json types.PreheatArgs) (*internaljob.GroupJobState, error) {
+func (p *preheat) CreatePreheat(ctx context.Context, schedulers []model.Scheduler, args types.PreheatArgs) (*internaljob.GroupJobState, error) {
 	var span trace.Span
 	ctx, span = tracer.Start(ctx, config.SpanPreheat, trace.WithSpanKind(trace.SpanKindProducer))
-	span.SetAttributes(config.AttributePreheatType.String(json.Type))
-	span.SetAttributes(config.AttributePreheatURL.String(json.URL))
+	span.SetAttributes(config.AttributePreheatType.String(args.Type))
+	span.SetAttributes(config.AttributePreheatURL.String(args.URL))
+	span.SetAttributes(config.AttributePreheatURL.String(args.Image))
 	defer span.End()
 
-	url := json.URL
-	rawheader := json.Headers
-
-	// Initialize queues
+	// Initialize scheduler queues
 	queues := getSchedulerQueues(schedulers)
 
 	// Generate download files
 	var files []*internaljob.PreheatRequest
-	switch PreheatType(json.Type) {
+	switch PreheatType(args.Type) {
 	case PreheatImageType:
-		// Parse image manifest url
-		image, err := parseAccessURL(url)
+		manifest, err := p.getManifest(ctx, args)
 		if err != nil {
 			return nil, err
 		}
 
-		files, err = p.getLayers(ctx, image, json)
-		if err != nil {
-			return nil, err
-		}
+		fmt.Println("1111111111")
+		fmt.Println(manifest)
+		fmt.Println("1111111111")
+
+		return nil, errors.New("testing")
+
+		// files, err = p.getLayers(ctx, manifest, args)
+		// if err != nil {
+		// return nil, err
+		// }
 	case PreheatFileType:
 		files = []*internaljob.PreheatRequest{
 			{
-				URL:     url,
+				URL:     args.URL,
 				Tag:     p.bizTag,
-				Headers: rawheader,
+				Headers: args.Headers,
 			},
 		}
 	default:
@@ -130,7 +124,7 @@ func (p *preheat) CreatePreheat(ctx context.Context, schedulers []model.Schedule
 	}
 
 	for _, f := range files {
-		logger.Infof("preheat %s file url: %v queues: %v", json.URL, f.URL, queues)
+		logger.Infof("preheat %s %s file url: %v queues: %v", args.URL, args.Image, f.URL, queues)
 	}
 
 	return p.createGroupJob(ctx, files, queues)
@@ -176,242 +170,70 @@ func (p *preheat) createGroupJob(ctx context.Context, files []*internaljob.Prehe
 	}, nil
 }
 
-func (p *preheat) getLayers(ctx context.Context, image *preheatImage, preheatArgs types.PreheatArgs) ([]*internaljob.PreheatRequest, error) {
-	ctx, span := tracer.Start(ctx, config.SpanGetLayers, trace.WithSpanKind(trace.SpanKindProducer))
-	defer span.End()
-
-	ocispecManifest, err := p.getManifests(ctx, image, preheatArgs.Username, preheatArgs.Password)
+func (p *preheat) getManifest(ctx context.Context, args types.PreheatArgs) (ocispec.Manifest, error) {
+	image, err := getImage(args)
 	if err != nil {
-		return nil, err
+		return ocispec.Manifest{}, err
 	}
-	layers, err := p.parseLayers(ocispecManifest, preheatArgs, image)
+	resolver := p.getResolver(ctx, args)
+
+	name, desc, err := resolver.Resolve(ctx, image)
 	if err != nil {
-		return nil, err
+		return ocispec.Manifest{}, err
 	}
 
-	return layers, nil
+	fetcher, err := resolver.Fetcher(ctx, name)
+	if err != nil {
+		return ocispec.Manifest{}, err
+	}
+
+	rc, err := fetcher.Fetch(ctx, desc)
+	if err != nil {
+		return ocispec.Manifest{}, fmt.Errorf("failed to fetch %s: %w", desc.Digest, err)
+	}
+	defer rc.Close()
+
+	return images.Manifest(ctx, contentutil.FromFetcher(fetcher), desc, platforms.Default())
 }
 
-func Fetch(ctx context.Context, f remotes.Fetcher, desc ocispec.Descriptor, dest io.Writer) error {
-	r, err := f.Fetch(ctx, desc)
-	defer func() {
-		closeErr := r.Close()
-		logger.Warnf("close fetch reader: %v", closeErr)
-	}()
-	if err != nil {
-		return err
-	}
-	dgstr := desc.Digest.Algorithm().Digester()
-	_, err = io.Copy(io.MultiWriter(dest, dgstr.Hash()), r)
-	if err != nil {
-		return err
-	}
-	if dgstr.Digest() != desc.Digest {
-		return fmt.Errorf("content mismatch: %s != %s", dgstr.Digest(), desc.Digest)
-	}
-
-	return nil
-}
-
-// getResolver returns a resolver.
-func (p *preheat) getResolver(ctx context.Context, username, password string) remotes.Resolver {
+// getResolver returns a docker resolver.
+func (p *preheat) getResolver(ctx context.Context, args types.PreheatArgs) remotes.Resolver {
 	creds := func(string) (string, string, error) {
-		return username, password, nil
+		return args.Username, args.Password, nil
 	}
-	options := docker.ResolverOptions{}
-	options.Hosts = docker.ConfigureDefaultRegistries(
-		docker.WithClient(defaultHTTPClient),
-		docker.WithAuthorizer(docker.NewDockerAuthorizer(
-			docker.WithAuthClient(defaultHTTPClient),
-			docker.WithAuthCreds(creds),
-		)),
-	)
-	return docker.NewResolver(options)
 
+	return docker.NewResolver(docker.ResolverOptions{
+		Hosts: docker.ConfigureDefaultRegistries(
+			docker.WithClient(defaultHTTPClient),
+			docker.WithAuthorizer(docker.NewDockerAuthorizer(
+				docker.WithAuthClient(defaultHTTPClient),
+				docker.WithAuthCreds(creds),
+			)),
+		),
+		Headers: httputils.MapToHeader(args.Headers),
+	})
 }
 
-func getAuthToken(ctx context.Context, header http.Header, preheatArgs types.PreheatArgs) (string, error) {
-	ctx, span := tracer.Start(ctx, config.SpanAuthWithRegistry, trace.WithSpanKind(trace.SpanKindProducer))
-	defer span.End()
-
-	authURL := authURL(header.Values("WWW-Authenticate"))
-	if len(authURL) == 0 {
-		return "", errors.New("authURL is empty")
+// getImage gets image name from types.PreheatArgs
+func getImage(args types.PreheatArgs) (string, error) {
+	if args.Image != "" {
+		return args.Image, nil
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "GET", authURL, nil)
-	if err != nil {
-		return "", err
-	}
-	if preheatArgs.Username != "" && preheatArgs.Password != "" {
-		req.SetBasicAuth(preheatArgs.Username, preheatArgs.Password)
-	}
-
-	resp, err := defaultHTTPClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", err
-	}
-
-	if result["token"] == nil {
-		return "", errors.New("token is empty")
-	}
-
-	token := fmt.Sprintf("%v", result["token"])
-	return token, nil
-
-}
-
-func authURL(wwwAuth []string) string {
-	// Bearer realm="<auth-service-url>",service="<service>",scope="repository:<name>:pull"
-	if len(wwwAuth) == 0 {
-		return ""
-	}
-	polished := make([]string, 0)
-	for _, it := range wwwAuth {
-		polished = append(polished, strings.ReplaceAll(it, "\"", ""))
-	}
-	fileds := strings.Split(polished[0], ",")
-	host := strings.Split(fileds[0], "=")[1]
-	query := strings.Join(fileds[1:], "&")
-	return fmt.Sprintf("%s?%s", host, query)
-}
-
-func (p *preheat) getManifests(ctx context.Context, image *preheatImage, username, password string) (ocispec.Manifest, error) {
-
-	resolver := p.getResolver(ctx, username, password)
-
-	// combine image url and tag
-	i := fmt.Sprintf("%s/%s:%s", image.domain, image.name, image.tag)
-
-	_, imageDesc, err := resolver.Resolve(ctx, i)
-	if err != nil {
-		return ocispec.Manifest{}, err
-	}
-	f, err := resolver.Fetcher(ctx, i)
-	if err != nil {
-		return ocispec.Manifest{}, err
-	}
-	r, err := f.Fetch(ctx, imageDesc)
-	if err != nil {
-		return ocispec.Manifest{}, fmt.Errorf("failed to fetch %s: %w", imageDesc.Digest, err)
-	}
-	defer r.Close()
-
-	descResponse, err := io.ReadAll(r)
-	if err != nil {
-		return ocispec.Manifest{}, fmt.Errorf("failed to read %s: %w", imageDesc.Digest, err)
-	}
-
-	platform := platforms.Only(platforms.DefaultSpec())
-	switch imageDesc.MediaType {
-	case images.MediaTypeDockerSchema2Manifest, ocispec.MediaTypeImageManifest:
-
-		var manifest ocispec.Manifest
-		if err := json.Unmarshal(descResponse, &manifest); err != nil {
-			return ocispec.Manifest{}, err
+	// Covert manifest url to image
+	if args.URL != "" {
+		r := accessURLPattern.FindStringSubmatch(args.URL)
+		if len(r) != 5 {
+			return "", errors.New("parse access url failed")
 		}
 
-		if manifest.Config.Digest == imageDesc.Digest && (!platform.Match(*manifest.Config.Platform)) {
-			return ocispec.Manifest{}, fmt.Errorf("manifest: invalid platform %s: %w", manifest.Config.Platform, err)
-		}
-
-		return manifest, nil
-	case images.MediaTypeDockerSchema2ManifestList, ocispec.MediaTypeImageIndex:
-		var idx ocispec.Index
-		if err := json.Unmarshal(descResponse, &idx); err != nil {
-			return ocispec.Manifest{}, err
-		}
-		return ocispec.Manifest{
-			Versioned:   idx.Versioned,
-			MediaType:   idx.MediaType,
-			Layers:      idx.Manifests,
-			Annotations: idx.Annotations,
-		}, nil
-	default:
-		return ocispec.Manifest{}, fmt.Errorf("unsupported manifest type %s", imageDesc.MediaType)
+		return fmt.Sprintf("%s/%s:%s", r[2], r[3], r[4]), nil
 	}
+
+	return "", errors.New("scheduler requires parameter image")
 }
 
-func references(om ocispec.Manifest) []ocispec.Descriptor {
-	references := make([]ocispec.Descriptor, 0, 1+len(om.Layers))
-	references = append(references, om.Config)
-	references = append(references, om.Layers...)
-	return references
-}
-
-func (p *preheat) parseLayers(om ocispec.Manifest, preheatArgs types.PreheatArgs, image *preheatImage) ([]*internaljob.PreheatRequest, error) {
-
-	var layers []*internaljob.PreheatRequest
-
-	req, err := http.NewRequestWithContext(context.Background(), "GET", preheatArgs.URL, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := defaultHTTPClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode/100 != 2 && resp.StatusCode != http.StatusUnauthorized {
-		return nil, fmt.Errorf("request registry %d", resp.StatusCode)
-	}
-
-	layerHeader := httputils.MapToHeader(preheatArgs.Headers).Clone()
-	if resp.StatusCode == http.StatusUnauthorized {
-		token, err := getAuthToken(context.Background(), resp.Header, preheatArgs)
-		if err != nil {
-			return nil, err
-		}
-
-		layerHeader.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-	}
-
-	for _, v := range references(om) {
-		digest := v.Digest.String()
-		if len(digest) == 0 {
-			continue
-		}
-		layer := &internaljob.PreheatRequest{
-			URL:     layerURL(image.protocol, image.domain, image.name, digest),
-			Tag:     p.bizTag,
-			Filter:  preheatArgs.Filter,
-			Digest:  digest,
-			Headers: httputils.HeaderToMap(layerHeader),
-		}
-
-		layers = append(layers, layer)
-	}
-
-	return layers, nil
-}
-
-func layerURL(protocol string, domain string, name string, digest string) string {
-	return fmt.Sprintf("%s://%s/v2/%s/blobs/%s", protocol, domain, name, digest)
-}
-
-func parseAccessURL(url string) (*preheatImage, error) {
-	r := accessURLPattern.FindStringSubmatch(url)
-	if len(r) != 5 {
-		return nil, errors.New("parse access url failed")
-	}
-
-	return &preheatImage{
-		protocol: r[1],
-		domain:   r[2],
-		name:     r[3],
-		tag:      r[4],
-	}, nil
-}
-
+// getSchedulerQueues gets scheduler job queues
 func getSchedulerQueues(schedulers []model.Scheduler) []internaljob.Queue {
 	var queues []internaljob.Queue
 	for _, scheduler := range schedulers {
@@ -425,3 +247,105 @@ func getSchedulerQueues(schedulers []model.Scheduler) []internaljob.Queue {
 
 	return queues
 }
+
+// func references(om ocispec.Manifest) []ocispec.Descriptor {
+// references := make([]ocispec.Descriptor, 0, 1+len(om.Layers))
+// references = append(references, om.Config)
+// references = append(references, om.Layers...)
+// return references
+// }
+
+// func (p *preheat) getLayers(ctx context.Context, manifest ocispec.Manifest, args types.PreheatArgs) ([]*internaljob.PreheatRequest, error) {
+// ctx, span := tracer.Start(ctx, config.SpanGetLayers, trace.WithSpanKind(trace.SpanKindProducer))
+// defer span.End()
+
+// layers, err := p.parseLayers(manifest)
+// if err != nil {
+// return nil, err
+// }
+
+// return layers, nil
+// }
+
+// func (p *preheat) parseLayers(manifest ocispec.Manifest, args types.PreheatArgs) ([]*internaljob.PreheatRequest, error) {
+// var layers []*internaljob.PreheatRequest
+
+// layerHeader := httputils.MapToHeader(args.Headers).Clone()
+// if resp.StatusCode == http.StatusUnauthorized {
+// token, err := getAuthToken(context.Background(), resp.Header, preheatArgs)
+// if err != nil {
+// return nil, err
+// }
+
+// layerHeader.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+// }
+
+// for _, v := range references(manifest) {
+// digest := v.Digest.String()
+// if len(digest) == 0 {
+// continue
+// }
+// layer := &internaljob.PreheatRequest{
+// URL:     layerURL(image.protocol, image.domain, image.name, digest),
+// Tag:     p.bizTag,
+// Digest:  digest,
+// Headers: httputils.HeaderToMap(layerHeader),
+// }
+
+// layers = append(layers, layer)
+// }
+
+// return layers, nil
+// }
+
+// func getAuthToken(ctx context.Context, header http.Header, preheatArgs types.PreheatArgs) (string, error) {
+// ctx, span := tracer.Start(ctx, config.SpanAuthWithRegistry, trace.WithSpanKind(trace.SpanKindProducer))
+// defer span.End()
+
+// authURL := authURL(header.Values("WWW-Authenticate"))
+// if len(authURL) == 0 {
+// return "", errors.New("authURL is empty")
+// }
+
+// req, err := http.NewRequestWithContext(ctx, "GET", authURL, nil)
+// if err != nil {
+// return "", err
+// }
+// if preheatArgs.Username != "" && preheatArgs.Password != "" {
+// req.SetBasicAuth(preheatArgs.Username, preheatArgs.Password)
+// }
+
+// resp, err := defaultHTTPClient.Do(req)
+// if err != nil {
+// return "", err
+// }
+// defer resp.Body.Close()
+
+// body, _ := io.ReadAll(resp.Body)
+// var result map[string]interface{}
+// if err := json.Unmarshal(body, &result); err != nil {
+// return "", err
+// }
+
+// if result["token"] == nil {
+// return "", errors.New("token is empty")
+// }
+
+// token := fmt.Sprintf("%v", result["token"])
+// return token, nil
+
+// }
+
+// func authURL(wwwAuth []string) string {
+// if len(wwwAuth) == 0 {
+// return ""
+// }
+// polished := make([]string, 0)
+// for _, it := range wwwAuth {
+// polished = append(polished, strings.ReplaceAll(it, "\"", ""))
+// }
+// fileds := strings.Split(polished[0], ",")
+// host := strings.Split(fileds[0], "=")[1]
+// query := strings.Join(fileds[1:], "&")
+// return fmt.Sprintf("%s?%s", host, query)
+// }
