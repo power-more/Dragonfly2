@@ -648,6 +648,90 @@ func TestServer_GetPieceTasks(t *testing.T) {
 	}
 }
 
+func TestServer_Download(t *testing.T) {
+	assert := testifyassert.New(t)
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	tests := []struct {
+		name   string
+		mock   func(mockTaskManager *peer.MockTaskManagerMockRecorder, r *dfdaemonv1.DownRequest)
+		expect func(t *testing.T, r *dfdaemonv1.DownRequest, res *dfdaemonv1.DownResult, err error)
+	}{
+		{
+			name: "error invalid argument",
+			mock: func(mockTaskManager *peer.MockTaskManagerMockRecorder, r *dfdaemonv1.DownRequest) {
+				mockTaskManager.StartFileTask(gomock.Any(), gomock.Any()).DoAndReturn(
+					func(ctx context.Context, req *peer.FileTaskRequest) (chan *peer.FileTaskProgress, bool, error) {
+						ch := make(chan *peer.FileTaskProgress)
+						go func() {
+							for i := 0; i <= 100; i++ {
+								ch <- &peer.FileTaskProgress{
+									State: &peer.ProgressState{
+										Success: true,
+									},
+									TaskID:          "",
+									PeerID:          "",
+									ContentLength:   100,
+									CompletedLength: int64(i),
+									PeerTaskDone:    i == 100,
+									DoneCallback:    func() {},
+								}
+							}
+							close(ch)
+						}()
+						return ch, false, nil
+					})
+			},
+			expect: func(t *testing.T, r *dfdaemonv1.DownRequest, res *dfdaemonv1.DownResult, err error) {
+				assert.NotNil(res)
+				assert.True(res.Done)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mockTaskManager := peer.NewMockTaskManager(ctrl)
+			r := &dfdaemonv1.DownRequest{
+				Uuid:              uuid.Generate().String(),
+				Url:               "http://localhost/test",
+				Output:            "./testdata/file1",
+				DisableBackSource: false,
+				UrlMeta: &commonv1.UrlMeta{
+					Tag: "unit test",
+				},
+				Pattern:    "p2p",
+				Callsystem: "",
+			}
+			tc.mock(mockTaskManager.EXPECT(), r)
+			s := &server{
+				KeepAlive:       util.NewKeepAlive("test"),
+				peerHost:        &schedulerv1.PeerHost{},
+				peerTaskManager: mockTaskManager,
+			}
+			s.downloadServer = dfdaemonserver.New(s)
+			client := setupPeerServerAndClient(t, s, assert, s.ServeDownload)
+			down, err := client.Download(context.Background(), r)
+			assert.Nil(err, "client download grpc call should be ok")
+
+			var (
+				lastResult *dfdaemonv1.DownResult
+				curResult  *dfdaemonv1.DownResult
+			)
+			for {
+				curResult, err = down.Recv()
+				if err == io.EOF {
+					break
+				}
+				assert.Nil(err)
+				lastResult = curResult
+			}
+			tc.expect(t, r, lastResult, err)
+		})
+	}
+}
+
 func TestServer_ServeDownload(t *testing.T) {
 	assert := testifyassert.New(t)
 	ctrl := gomock.NewController(t)
